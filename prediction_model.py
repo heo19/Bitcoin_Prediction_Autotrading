@@ -4,15 +4,31 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
-from sklearn.utils import class_weight
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 # ---------------------------
 # 1. Load and Prepare Data
 # ---------------------------
 df = pd.read_csv("./data/binance_btcusdt_15MIN.csv")
-df = df.iloc[300:].reset_index(drop=True)
 
+# If you have not yet created these columns in your CSV, uncomment below:
+"""
+if "pct_change_current" not in df.columns:
+    df["pct_change_current"] = df["close"].pct_change() * 100
+
+if "pct_change_future" not in df.columns:
+    df["pct_change_future"] = ((df["close"].shift(-1) - df["close"]) / df["close"]) * 100
+    df.dropna(subset=["pct_change_future"], inplace=True)
+    df.reset_index(drop=True, inplace=True)
+"""
+
+df = df.iloc[300:].reset_index(drop=True)  # optional skip of early data
+
+# ---------------------------
+# 2. Select Features & Label
+# ---------------------------
+# "pct_change_current" is now an input feature
+# "pct_change_future" is our label
 features = [
     "open", "high", "low", "close", "volume", "quote_asset_volume",
     "number_of_trades", "taker_buy_base_volume", "taker_buy_quote_volume",
@@ -27,36 +43,37 @@ features = [
     # Bollinger (length=200)
     "BBL_200_2.0", "BBM_200_2.0", "BBU_200_2.0", "BBB_200_2.0", "BBP_200_2.0",
     # OBV
-    "OBV"
+    "OBV",
+    # NEW Feature
+    "pct_change_current"
 ]
 
-# If label doesn't exist, create it
-if "label" not in df.columns:
-    df["next_close"] = df["close"].shift(-1)
-    df["price_change"] = df["next_close"] - df["close"]
-    df["label"] = (df["price_change"] > 0).astype(int)
-    df.dropna(subset=["next_close"], inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    print("Binary 'label' column created.")
-else:
-    print("Label column already exists. Proceeding with existing labels.")
+# Create the NumPy array of features
+X_all = df[features].values
+
+# Our target (regression) is the future price percentage change
+y_all = df["pct_change_future"].values
 
 # ---------------------------
-# 2. Scale Data (Features Only)
+# 3. Handle NaNs & Scaling
 # ---------------------------
-data = df[features].values
-if np.isnan(data).any():
-    print("Data contains NaN values. Handling NaNs...")
-    data = np.nan_to_num(data, nan=0.0)
+if np.isnan(X_all).any():
+    print("Feature data contains NaN values. Replacing them with 0.0...")
+    X_all = np.nan_to_num(X_all, nan=0.0)
 
+if np.isnan(y_all).any():
+    print("Label data contains NaN values. Dropping or replacing them with 0.0...")
+    # Here we simply remove any row with a NaN label
+    valid_mask = ~np.isnan(y_all)
+    X_all = X_all[valid_mask]
+    y_all = y_all[valid_mask]
+
+# Scale the features (X) using MinMaxScaler
 scaler = MinMaxScaler()
-data_scaled = scaler.fit_transform(data)
-
-X_all = data_scaled
-y_all = df["label"].values  # 0 or 1
+X_scaled = scaler.fit_transform(X_all)
 
 # ---------------------------
-# 3. Create Sliding Windows
+# 4. Create Sliding Windows
 # ---------------------------
 def create_sliding_windows(X, y, lookback=24):
     X_slid, y_slid = [], []
@@ -65,15 +82,16 @@ def create_sliding_windows(X, y, lookback=24):
         y_slid.append(y[i + lookback])
     return np.array(X_slid), np.array(y_slid)
 
+# Increase the lookback as desired
 lookback = 96
-X_slid, y_slid = create_sliding_windows(X_all, y_all, lookback)
+X_slid, y_slid = create_sliding_windows(X_scaled, y_all, lookback)
 
 # ---------------------------
-# 4. Train/Val/Test Split
+# 5. Train/Val/Test Split
 # ---------------------------
 train_size = int(0.7 * len(X_slid))
-val_size = int(0.15 * len(X_slid))
-test_size = len(X_slid) - train_size - val_size
+val_size   = int(0.15 * len(X_slid))
+test_size  = len(X_slid) - train_size - val_size
 
 X_train = X_slid[:train_size]
 y_train = y_slid[:train_size]
@@ -87,7 +105,7 @@ y_test = y_slid[train_size + val_size :]
 print(f"Train size: {train_size}, Val size: {val_size}, Test size: {test_size}")
 
 # ---------------------------
-# 5. Dataset Definition
+# 6. Dataset Definition
 # ---------------------------
 class TimeSeriesDataset(Dataset):
     def __init__(self, X, y):
@@ -105,72 +123,69 @@ class TimeSeriesDataset(Dataset):
         )
 
 train_dataset = TimeSeriesDataset(X_train, y_train)
-val_dataset = TimeSeriesDataset(X_val, y_val)
-test_dataset = TimeSeriesDataset(X_test, y_test)
+val_dataset   = TimeSeriesDataset(X_val, y_val)
+test_dataset  = TimeSeriesDataset(X_test, y_test)
 
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
-test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+val_loader   = DataLoader(val_dataset, batch_size=32, shuffle=False)
+test_loader  = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
 # ---------------------------
-# 6. Simple CNN Model
-#     - 2 Convolution Blocks
-#     - No BatchNorm
-#     - No Dropout
+# 7. LSTM Model for Regression
 # ---------------------------
-class SimpleCNN(nn.Module):
-    """
-    A small 2-layer CNN for debugging/troubleshooting.
-    Removes BatchNorm and Dropout.
-    """
-    def __init__(self, input_dim=27, num_filters=64, kernel_size=3):
-        super(SimpleCNN, self).__init__()
+class SimpleLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim=64, num_layers=1):
+        super(SimpleLSTM, self).__init__()
         
-        self.conv1 = nn.Conv1d(
-            in_channels=input_dim,
-            out_channels=num_filters,
-            kernel_size=kernel_size,
-            padding="same"
-        )
-        self.relu = nn.ReLU()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
         
-        self.conv2 = nn.Conv1d(
-            in_channels=num_filters,
-            out_channels=num_filters * 2,
-            kernel_size=kernel_size,
-            padding="same"
+        # input_dim = number of features
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True
         )
         
-        self.fc = nn.Linear(num_filters * 2, 1)
+        # A single linear layer to go from hidden_dim -> 1
+        self.fc = nn.Linear(hidden_dim, 1)
 
     def forward(self, x):
-        # x shape: (batch_size, lookback, input_dim)
-        # permute to (batch_size, input_dim, lookback)
-        x = x.permute(0, 2, 1)
-        
-        x = self.conv1(x)    # (batch_size, num_filters, lookback)
-        x = self.relu(x)
-        
-        x = self.conv2(x)    # (batch_size, num_filters*2, lookback)
-        x = self.relu(x)
-        
-        # global average pooling over time dimension
-        x = torch.mean(x, dim=-1)  # (batch_size, num_filters*2)
-        
-        x = self.fc(x)            # (batch_size, 1)
-        return x
+        # x: (batch_size, lookback, input_dim)
+        batch_size = x.size(0)
+
+        # Initialize hidden state and cell state with zeros
+        h0 = torch.zeros(self.num_layers, batch_size, self.hidden_dim, device=x.device)
+        c0 = torch.zeros(self.num_layers, batch_size, self.hidden_dim, device=x.device)
+
+        # LSTM
+        out, (hn, cn) = self.lstm(x, (h0, c0))
+        # out: (batch_size, lookback, hidden_dim)
+
+        # Take the last time step's output
+        out_last = out[:, -1, :]  # (batch_size, hidden_dim)
+
+        # Pass it through a fully connected layer
+        out = self.fc(out_last)   # (batch_size, 1)
+        return out
 
 # ---------------------------
-# 7. Loss & Optimizer
+# 8. Loss & Optimizer
+#    For regression, we typically use MSELoss
 # ---------------------------
-criterion = nn.BCEWithLogitsLoss()
+criterion = nn.MSELoss()
+lr = 1e-3  # Adjust if needed
 
-# Lower learning rate if training is unstable, or higher if stuck
-# We'll set it to 1e-4 to see if we can move away from 0.693 easily
-lr = 1e-4
+# Instantiate the LSTM model
+# input_dim = number of features
+input_dim = X_train.shape[2]  # i.e. 27 + 1 new feature, etc.
+model = SimpleLSTM(input_dim=input_dim, hidden_dim=64, num_layers=1)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
 # ---------------------------
-# 8. Training & Evaluation
+# 9. Training & Evaluation
 # ---------------------------
 def evaluate(model, data_loader, criterion, device="cpu"):
     model.eval()
@@ -178,7 +193,7 @@ def evaluate(model, data_loader, criterion, device="cpu"):
     with torch.no_grad():
         for X_batch, y_batch in data_loader:
             X_batch = X_batch.to(device)
-            y_batch = y_batch.to(device).unsqueeze(1).float()
+            y_batch = y_batch.to(device).unsqueeze(1)  # shape: (batch_size, 1)
             
             outputs = model(X_batch)
             loss = criterion(outputs, y_batch)
@@ -195,7 +210,6 @@ def train_model(
     device="cpu",
 ):
     model.to(device)
-
     best_val_loss = float("inf")
     best_model_state = None
 
@@ -205,7 +219,7 @@ def train_model(
         
         for X_batch, y_batch in train_loader:
             X_batch = X_batch.to(device)
-            y_batch = y_batch.to(device).unsqueeze(1).float()
+            y_batch = y_batch.to(device).unsqueeze(1)  # (batch_size, 1)
             
             optimizer.zero_grad()
             outputs = model(X_batch)
@@ -216,68 +230,45 @@ def train_model(
             train_losses.append(loss.item())
 
         train_loss_avg = np.mean(train_losses)
-        val_loss_avg = evaluate(model, val_loader, criterion, device=device)
+        val_loss_avg   = evaluate(model, val_loader, criterion, device=device)
 
         print(f"Epoch [{epoch+1}/{num_epochs}] "
               f"Train Loss: {train_loss_avg:.6f} "
               f"Val Loss: {val_loss_avg:.6f}")
 
-        # We won't do early stopping for debugging:
+        # Track the best model
         if val_loss_avg < best_val_loss:
             best_val_loss = val_loss_avg
             best_model_state = model.state_dict()
 
-    # Load the best model weights
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
-
-    # Print final debug info
-    print("\nDebug Info:")
-    print(f"Final Train Loss: {train_loss_avg:.6f}")
-    print(f"Best Val Loss:    {best_val_loss:.6f}")
+    print("\nTraining finished.")
+    print(f"Best Val Loss: {best_val_loss:.6f}")
     return model
 
 def get_predictions(model, data_loader, device="cpu"):
     model.eval()
     all_targets = []
-    all_logits = []
+    all_preds   = []
     with torch.no_grad():
         for X_batch, y_batch in data_loader:
             X_batch = X_batch.to(device)
             y_batch = y_batch.to(device)
             
             preds = model(X_batch)
-            all_logits.extend(preds.cpu().numpy())
-            all_targets.extend(y_batch.cpu().numpy())
-    return np.array(all_targets), np.array(all_logits)
-
-def check_label_distribution(y, dataset_name="Dataset"):
-    unique, counts = np.unique(y, return_counts=True)
-    distribution = dict(zip(unique, counts))
-    print(f"\nLabel distribution in {dataset_name}:")
-    for label, count in distribution.items():
-        percentage = (count / len(y)) * 100
-        print(f"Label {int(label)}: {count} samples ({percentage:.2f}%)")
+            all_preds.extend(preds.cpu().numpy().flatten())
+            all_targets.extend(y_batch.cpu().numpy().flatten())
+    return np.array(all_targets), np.array(all_preds)
 
 # ---------------------------
-# 9. Main Execution
+# 10. Main Execution
 # ---------------------------
 if __name__ == "__main__":
-    # Print label distribution
-    check_label_distribution(y_train, "Training Set")
-    check_label_distribution(y_val, "Validation Set")
-    check_label_distribution(y_test, "Test Set")
-
     # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Instantiate the simpler CNN model
-    model = SimpleCNN(input_dim=27, num_filters=64, kernel_size=3)
-
-    # Create optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-    # Train the model (no early stopping)
+    
+    # Train the model
     model = train_model(
         model=model,
         train_loader=train_loader,
@@ -289,44 +280,34 @@ if __name__ == "__main__":
     )
     
     # Evaluate on the test set
-    y_true, y_logits = get_predictions(model, test_loader, device=device)
+    y_true, y_pred = get_predictions(model, test_loader, device=device)
     
-    # Convert logits to probabilities
-    y_prob = 1 / (1 + np.exp(-y_logits))
-    y_pred = (y_prob >= 0.5).astype(int)
-    
-    accuracy  = accuracy_score(y_true, y_pred)
-    precision = precision_score(y_true, y_pred, zero_division=0)
-    recall    = recall_score(y_true, y_pred, zero_division=0)
-    f1        = f1_score(y_true, y_pred, zero_division=0)
-    roc_auc   = roc_auc_score(y_true, y_prob)
-    
-    print("\nClassification Metrics:")
-    print(f"Accuracy:  {accuracy:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall:    {recall:.4f}")
-    print(f"F1 Score:  {f1:.4f}")
-    print(f"ROC AUC:   {roc_auc:.4f}")
+    # Calculate regression metrics
+    mse = mean_squared_error(y_true, y_pred)
+    mae = mean_absolute_error(y_true, y_pred)
+    r2  = r2_score(y_true, y_pred)
 
-    # Save classification metrics
+    print("\nRegression Metrics on Test Set:")
+    print(f"MSE: {mse:.4f}")
+    print(f"MAE: {mae:.4f}")
+    print(f"R2:  {r2:.4f}")
+
+    # Save metrics
     metrics_dict = {
-        "accuracy":  [accuracy],
-        "precision": [precision],
-        "recall":    [recall],
-        "f1_score":  [f1],
-        "roc_auc":   [roc_auc]
+        "mse": [mse],
+        "mae": [mae],
+        "r2":  [r2]
     }
     df_metrics = pd.DataFrame(metrics_dict)
-    df_metrics.to_csv("test_metrics_classification.csv", index=False)
-    print("\nSaved test_metrics_classification.csv")
+    df_metrics.to_csv("test_metrics_regression.csv", index=False)
+    print("\nSaved test_metrics_regression.csv")
     
-    # Save predictions
+    # Save predictions vs. true
     df_results = pd.DataFrame({
         "y_true": y_true,
-        "y_prob": y_prob.flatten(),
-        "y_pred": y_pred.flatten()
+        "y_pred": y_pred
     })
-    df_results.to_csv("predictions_classification.csv", index=False)
-    print("Saved predictions_classification.csv")
-    
+    df_results.to_csv("predictions_regression.csv", index=False)
+    print("Saved predictions_regression.csv")
+
     print("\nDone!")
